@@ -85,6 +85,28 @@ def maybe_trigger_remote_instance_nccl_send_group(
             t.start()
 
 
+def _model_has_baked_fp8_kv_scales(model) -> bool:
+    """True if any submodule has non-default per-layer FP8 KV scales from the checkpoint.
+
+    BaseKVCacheMethod.process_weights_after_loading sets k_scale_float/v_scale_float
+    to calibrated values when scales were in the checkpoint, or to 1.0 when missing.
+    Plain RadixAttention without a KV quant method leaves them as None.
+    """
+    for module in model.modules():
+        k = getattr(module, "k_scale_float", None)
+        v = getattr(module, "v_scale_float", None)
+        if k is None or v is None:
+            continue
+        try:
+            k_f = float(k)
+            v_f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if k_f != 1.0 or v_f != 1.0:
+            return True
+    return False
+
+
 def load_kv_cache_scales(*, model, server_args: ServerArgs) -> None:
     if server_args.kv_cache_dtype == "fp8_e4m3":
         if server_args.quantization_param_path is not None:
@@ -101,11 +123,16 @@ def load_kv_cache_scales(*, model, server_args: ServerArgs) -> None:
                     model.__class__,
                 )
         else:
-            logger.warning(
-                "Using FP8 KV cache but no scaling factors "
-                "provided. Defaulting to scaling factors of 1.0. "
-                "This may lead to less accurate results!"
-            )
+            if _model_has_baked_fp8_kv_scales(model):
+                logger.info(
+                    "Using FP8 KV cache with per-layer scaling factors from the checkpoint."
+                )
+            else:
+                logger.warning(
+                    "Using FP8 KV cache but no scaling factors "
+                    "provided. Defaulting to scaling factors of 1.0. "
+                    "This may lead to less accurate results!"
+                )
 
 
 def resolve_sliding_window_size(model, model_config: ModelConfig) -> Optional[int]:
