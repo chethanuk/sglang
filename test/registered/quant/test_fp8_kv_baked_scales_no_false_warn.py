@@ -14,7 +14,7 @@ test_quark_mxfp4) that use popen_launch_server(..., return_stdout_stderr=...).
 
 from __future__ import annotations
 
-import os
+import io
 import unittest
 
 from sglang.srt.utils import kill_process_tree
@@ -31,8 +31,6 @@ register_cuda_ci(est_time=120, stage="extra-a", runner_config="1-gpu-large")
 # Same FP8-KV model used by test_fp8kv_triton.py — checkpoint carries per-layer
 # KV scales (modern baked path, not --quantization-param-path).
 MODEL = "neuralmagic/Meta-Llama-3-8B-Instruct-FP8-KV"
-STDOUT_FILENAME = "fp8_kv_scale_warn_stdout.log"
-STDERR_FILENAME = "fp8_kv_scale_warn_stderr.log"
 WARN_SNIPPET = "no scaling factors"
 INFO_SNIPPET = "per-layer scaling factors from the checkpoint"
 
@@ -42,8 +40,10 @@ class TestFp8KvBakedScalesNoFalseWarn(CustomTestCase):
     def setUpClass(cls):
         cls.model = MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.stdout = open(STDOUT_FILENAME, "w")
-        cls.stderr = open(STDERR_FILENAME, "w")
+        # Match test_quark_mxfp4 / test_soft_watchdog: StringIO avoids on-disk
+        # log files and cwd collisions under parallel CI.
+        cls.stdout = io.StringIO()
+        cls.stderr = io.StringIO()
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -66,17 +66,9 @@ class TestFp8KvBakedScalesNoFalseWarn(CustomTestCase):
         kill_process_tree(cls.process.pid)
         cls.stdout.close()
         cls.stderr.close()
-        for f in (STDOUT_FILENAME, STDERR_FILENAME):
-            if os.path.exists(f):
-                os.remove(f)
 
     def _server_logs(self) -> str:
-        text = ""
-        for f in (STDOUT_FILENAME, STDERR_FILENAME):
-            if os.path.exists(f):
-                with open(f) as fh:
-                    text += fh.read()
-        return text
+        return self.stdout.getvalue() + self.stderr.getvalue()
 
     def test_no_false_missing_scales_warning(self):
         """Baked FP8 KV scales must not trigger the missing-scales warning."""
