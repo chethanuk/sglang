@@ -310,6 +310,8 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         ), "Hybrid SWA model must have at least one SWA layer"
 
         self._swa_full_tokens_ratio = kvc.server_args.swa_full_tokens_ratio
+        self._sliding_window_size = kvc.sliding_window_size
+        self._chunked_prefill_size = kvc.server_args.chunked_prefill_size
 
         # Full layer per-token memory (bytes)
         self._full_per_token = (
@@ -383,6 +385,26 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         # Hybrid: full_tokens = max_total_num_tokens, swa_tokens = full_tokens * ratio
         full_tokens = align_page_size(max_total_num_tokens)
         swa_tokens = align_page_size(int(full_tokens * self._swa_full_tokens_ratio))
+
+        if self._sliding_window_size is not None:
+            floor = self._sliding_window_size + page_size
+            if floor >= swa_tokens:
+                raise RuntimeError(
+                    f"SWA pool ({swa_tokens} tokens) cannot hold one request's minimum "
+                    f"reservation (sliding_window_size {self._sliding_window_size} + "
+                    f"page_size {page_size} = {floor}); no request could ever be scheduled. "
+                    f"Raise --swa-full-tokens-ratio (currently {self._swa_full_tokens_ratio}) "
+                    f"or pass --disable-hybrid-swa-memory."
+                )
+        if self._chunked_prefill_size is not None and self._chunked_prefill_size > 0:
+            if self._chunked_prefill_size + page_size > swa_tokens:
+                logger.warning(
+                    f"--chunked-prefill-size {self._chunked_prefill_size} + page_size "
+                    f"{page_size} exceeds the SWA pool ({swa_tokens} tokens); prefill "
+                    f"chunks will be clamped to the SWA pool, reducing prefill batch "
+                    f"efficiency. Raise --swa-full-tokens-ratio (currently "
+                    f"{self._swa_full_tokens_ratio}) or lower --chunked-prefill-size."
+                )
 
         logger.info(
             f"Use sliding window memory pool. "

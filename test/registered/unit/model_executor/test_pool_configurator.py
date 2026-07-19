@@ -305,6 +305,47 @@ class TestHybridSWAConfigurator(unittest.TestCase):
             int(config.full_max_total_num_tokens * 0.5),
         )
 
+    def test_raises_when_swa_pool_below_window_plus_page(self):
+        """SWA pool that cannot hold window+page is unusable — fail at startup."""
+        mr = self._make_swa_runner(ratio=0.01, page_size=1)
+        # Force a tiny SWA pool via max tokens: full=50, ratio=0.01 → swa=0 after align
+        # Use ratio that yields swa < window+page with an explicit window.
+        mr.sliding_window_size = 128
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                HybridSWAPoolConfigurator,
+            )
+
+            cfg = HybridSWAPoolConfigurator(mr)
+            with self.assertRaises(RuntimeError) as cm:
+                cfg.calculate_pool_sizes_from_max_tokens(200, page_size=1)
+        self.assertIn("cannot hold one request's minimum", str(cm.exception))
+        self.assertIn("sliding_window_size", str(cm.exception))
+
+    def test_warns_when_chunked_prefill_exceeds_swa_pool(self):
+        """chunked_prefill_size + page > SWA pool → warning, not hard fail."""
+        import logging
+
+        mr = self._make_swa_runner(ratio=0.1, page_size=1)
+        mr.sliding_window_size = 16
+        mr.server_args.chunked_prefill_size = 5000
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                HybridSWAPoolConfigurator,
+            )
+
+            cfg = HybridSWAPoolConfigurator(mr)
+            with self.assertLogs(
+                "sglang.srt.model_executor.pool_configurator", level=logging.WARNING
+            ) as cm:
+                # full=10000, ratio=0.1 → swa=1000; chunk 5000 + page 1 > 1000
+                config = cfg.calculate_pool_sizes_from_max_tokens(10000, page_size=1)
+        self.assertEqual(config.swa_max_total_num_tokens, 1000)
+        self.assertTrue(
+            any("chunked-prefill-size" in m for m in cm.output),
+            msg=cm.output,
+        )
+
     def test_chunk_cache_cap_accounts_for_spec_topk_page_rounding(self):
         available = 1_000_000
         mr = _make_model_runner(
