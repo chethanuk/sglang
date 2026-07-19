@@ -555,6 +555,93 @@ class TestPrefillAdder(CustomTestCase):
         req.set_extend_range.assert_called_once_with(0, 200)
         self.assertIn(req, adder.can_run_list)
 
+    def _build_hybrid_swa_add_one_req(
+        self,
+        *,
+        page_size,
+        rem_swa,
+        rem_chunk,
+        extend_input_len,
+        sliding_window_size=128,
+        full_available=100_000,
+    ):
+        """Fixture for add_one_req under hybrid SWA (issue #31205)."""
+        self.mock_token_allocator.swa_available_size.return_value = rem_swa
+        self.mock_token_allocator.full_available_size.return_value = full_available
+        self.mock_token_allocator.available_size.return_value = full_available
+        self.mock_tree_cache.sliding_window_size = sliding_window_size
+        self.mock_tree_cache.is_tree_cache.return_value = False
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=page_size,
+            rem_chunk_tokens=rem_chunk,
+        )
+        adder.is_hybrid_swa = True
+
+        req = self.create_mock_req("add_one", priority=0, max_new_tokens=128)
+        req.sampling_params = SimpleNamespace(max_new_tokens=128, ignore_eos=False)
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.needs_host_load_back.return_value = False
+        req.last_node = MagicMock()
+        req.prefix_indices = []
+        req.full_untruncated_fill_ids = list(range(extend_input_len))
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        return adder, req
+
+    def test_add_one_req_hybrid_swa_clamps_chunk_to_swa_capacity(self):
+        # Regression for #31205: when rem_chunk_tokens > SWA pool, add_one_req
+        # used to return NO_TOKEN forever (unsatisfiable at any occupancy) and
+        # starve the FCFS queue. It must clamp the chunk like add_chunked_req.
+        PAGE_SIZE = 64
+        REM_SWA = 1000
+        REM_CHUNK = 4096  # > SWA pool → the bug condition
+        EXTEND = 2000  # longer than the SWA pool
+
+        adder, req = self._build_hybrid_swa_add_one_req(
+            page_size=PAGE_SIZE,
+            rem_swa=REM_SWA,
+            rem_chunk=REM_CHUNK,
+            extend_input_len=EXTEND,
+        )
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertIsNot(result, AddReqResult.NO_TOKEN)
+        expected_trunc = (REM_SWA - PAGE_SIZE) // PAGE_SIZE * PAGE_SIZE  # 896
+        req.set_extend_range.assert_called_once_with(0, expected_trunc)
+        start, end = req.set_extend_range.call_args.args
+        self.assertLessEqual((end - start) + PAGE_SIZE, REM_SWA)
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertEqual(len(adder.can_run_list), 1)
+
+    def test_add_one_req_hybrid_swa_defers_when_swa_below_window(self):
+        # Legitimate transient back-pressure: SWA cap below the sliding window
+        # means even a 1-token chunk cannot be reserved. Must still defer.
+        PAGE_SIZE = 64
+        REM_SWA = 128  # swa_cap = 128 - 64 = 64 < window 128
+        adder, req = self._build_hybrid_swa_add_one_req(
+            page_size=PAGE_SIZE,
+            rem_swa=REM_SWA,
+            rem_chunk=4096,
+            extend_input_len=2000,
+            sliding_window_size=128,
+        )
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertIs(result, AddReqResult.NO_TOKEN)
+        req.set_extend_range.assert_not_called()
+        self.assertEqual(len(adder.can_run_list), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

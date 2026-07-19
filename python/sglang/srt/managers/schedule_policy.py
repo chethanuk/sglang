@@ -641,6 +641,19 @@ class PrefillAdder:
             budget += self.ceil_paged_tokens(swa_host_hit_length)
         return budget
 
+    def _swa_chunk_cap(self, swa_host_hit_length: int = 0) -> int:
+        """Largest new-token count a request may prefill this pass without
+        over-committing the SWA pool. Only valid when is_hybrid_swa is True.
+
+        Mirrors add_chunked_req: alloc_extend needs extend_num_tokens + page_size,
+        so one page is reserved. Host-hit tokens land in the same pool before the
+        chunk does, so they come out of the same budget.
+        """
+        cap = int(self.rem_swa_tokens) - self.page_size
+        if swa_host_hit_length > 0:
+            cap -= self.ceil_paged_tokens(swa_host_hit_length)
+        return cap
+
     def _mamba_gap_budget_for_req(self, req: Req) -> int:
         """Shared-gap reservation (full-token-equivalents) for a request's new
         mamba state. Charged only on the SHARED Mamba pool (`_mamba_slot_cost > 0`)
@@ -1021,12 +1034,19 @@ class PrefillAdder:
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
+        # Hybrid SWA: clamp the prefill chunk to SWA capacity rather than
+        # refusing the request. A chunk larger than the SWA pool is unsatisfiable
+        # at ANY occupancy, so the old NO_TOKEN gate starved the FCFS queue forever
+        # (#31205). Mirrors add_chunked_req's clamp.
+        chunk_cap = self.rem_chunk_tokens
         if self.is_hybrid_swa:
-            swa_needed = self._swa_budget_for_req(
-                cand_extend_input_len, swa_host_hit_length=req.swa_host_hit_length
-            )
-            if swa_needed >= self.rem_swa_tokens:
+            swa_cap = self._swa_chunk_cap(req.swa_host_hit_length)
+            if swa_cap < self.tree_cache.sliding_window_size:
+                # Even a 1-token chunk reserves sliding_window_size + page_size of SWA.
+                # No room this pass; retry next pass.
                 return AddReqResult.NO_TOKEN
+            if chunk_cap is not None:
+                chunk_cap = min(chunk_cap, swa_cap)
 
         if (
             self.rem_chunk_tokens is None
@@ -1043,12 +1063,14 @@ class PrefillAdder:
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
+            # rem_swa_tokens can drop after lock acquisition — recompute cap.
+            chunk_cap = self.rem_chunk_tokens
             if self.is_hybrid_swa:
-                swa_needed = self._swa_budget_for_req(
-                    cand_extend_input_len, swa_host_hit_length=req.swa_host_hit_length
-                )
-                if swa_needed >= self.rem_swa_tokens:
+                swa_cap = self._swa_chunk_cap(req.swa_host_hit_length)
+                if swa_cap < self.tree_cache.sliding_window_size:
                     return AddReqResult.NO_TOKEN
+                if chunk_cap is not None:
+                    chunk_cap = min(chunk_cap, swa_cap)
 
             if req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
@@ -1086,7 +1108,7 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+            elif chunk_cap is None or input_tokens <= chunk_cap:
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
@@ -1106,7 +1128,7 @@ class PrefillAdder:
                 )
             else:
                 # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+                trunc_len = chunk_cap // self.page_size * self.page_size
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
