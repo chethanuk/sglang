@@ -5,8 +5,11 @@ context length, GGUF detection, etc.) that don't require actual model files.
 """
 
 import inspect
+import json
+import logging
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -15,6 +18,7 @@ from transformers.image_processing_utils import BaseImageProcessor
 
 import sglang.srt.utils.hf_transformers.processor as processor_utils
 from sglang.srt.utils import hf_transformers_patches
+from sglang.srt.utils.hf_transformers import tokenizer as tokenizer_mod
 from sglang.srt.utils.hf_transformers.common import (
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
@@ -25,7 +29,11 @@ from sglang.srt.utils.hf_transformers.common import (
     get_hf_text_config,
     get_rope_config,
 )
-from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
+from sglang.srt.utils.hf_transformers.tokenizer import (
+    _fix_special_tokens_pattern,
+    _load_tokenizer_by_declared_class,
+    _resolve_tokenizers_backend,
+)
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -488,6 +496,93 @@ class TestFixSpecialTokensPattern(unittest.TestCase):
         tok = SimpleNamespace(cls_token_id=None, sep_token_id=None)
         _fix_special_tokens_pattern(tok)
         self.assertFalse(hasattr(tok, "special_tokens_pattern"))
+
+
+# ---------------------------------------------------------------------------
+# _resolve_tokenizers_backend — generic declared classes (gpt-oss / #31271)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveTokenizersBackendGeneric(unittest.TestCase):
+    """gpt-oss and similar models declare PreTrainedTokenizerFast, which is an
+    alias of TokenizersBackend in transformers v5. Staying on that type is
+    correct; the resolve path must not warn as if a model-specific class was
+    missing.
+    """
+
+    _WARN_SNIPPET = "still TokenizersBackend after retries"
+
+    def _write_tokenizer_config(self, tok_class_name: str) -> str:
+        tmp = tempfile.mkdtemp()
+        path = Path(tmp) / "tokenizer_config.json"
+        path.write_text(json.dumps({"tokenizer_class": tok_class_name}))
+        return tmp
+
+    def _backend_dummy(self):
+        return type("TokenizersBackend", (), {})()
+
+    def _capture_warnings(self):
+        records = []
+
+        class _ListHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                if record.levelno >= logging.WARNING:
+                    records.append(record.getMessage())
+
+        handler = _ListHandler(level=logging.WARNING)
+        logger = tokenizer_mod.logger
+        logger.addHandler(handler)
+        return records, handler, logger
+
+    def test_no_warning_when_declared_class_is_pretrained_tokenizer_fast(self):
+        # Repro for #31271: openai/gpt-oss-20b declares PreTrainedTokenizerFast.
+        model_dir = self._write_tokenizer_config("PreTrainedTokenizerFast")
+        dummy = self._backend_dummy()
+        records, handler, logger = self._capture_warnings()
+        try:
+            with patch.object(
+                tokenizer_mod.AutoTokenizer, "from_pretrained", return_value=dummy
+            ):
+                out = _resolve_tokenizers_backend(model_dir, trust_remote_code=True)
+        finally:
+            logger.removeHandler(handler)
+
+        self.assertEqual(type(out).__name__, "TokenizersBackend")
+        matching = [m for m in records if self._WARN_SNIPPET in m]
+        self.assertEqual(
+            matching,
+            [],
+            f"false-positive TokenizersBackend warning for generic declared class: {matching}",
+        )
+
+    def test_warning_when_declared_class_is_specific_and_still_backend(self):
+        model_dir = self._write_tokenizer_config("LlamaTokenizerFast")
+        dummy = self._backend_dummy()
+        records, handler, logger = self._capture_warnings()
+        try:
+            with patch.object(
+                tokenizer_mod.AutoTokenizer, "from_pretrained", return_value=dummy
+            ), patch.object(
+                tokenizer_mod,
+                "_load_tokenizer_by_declared_class",
+                return_value=None,
+            ):
+                out = _resolve_tokenizers_backend(model_dir, trust_remote_code=True)
+        finally:
+            logger.removeHandler(handler)
+
+        self.assertEqual(type(out).__name__, "TokenizersBackend")
+        matching = [m for m in records if self._WARN_SNIPPET in m]
+        self.assertEqual(
+            len(matching),
+            1,
+            f"expected warning when specific declared class fails to load, got: {records}",
+        )
+
+    def test_load_by_declared_class_returns_none_for_generic_fast_name(self):
+        model_dir = self._write_tokenizer_config("PreTrainedTokenizerFast")
+        # Must short-circuit without needing real tokenizer.json / backend files.
+        self.assertIsNone(_load_tokenizer_by_declared_class(model_dir))
 
 
 # ---------------------------------------------------------------------------

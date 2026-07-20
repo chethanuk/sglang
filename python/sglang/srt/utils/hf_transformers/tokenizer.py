@@ -49,6 +49,37 @@ _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 # Class name used by transformers v5 when no tokenizer mapping exists for a model_type.
 _TOKENIZERS_BACKEND = "TokenizersBackend"
 
+# Declared tokenizer_class values that are generic bases/aliases, not model-specific
+# classes. In transformers v5, PreTrainedTokenizerFast is an alias of TokenizersBackend,
+# so "still TokenizersBackend" after load is expected for models like gpt-oss (#31271).
+_GENERIC_TOKENIZER_CLASS_NAMES = frozenset(
+    {
+        "TokenizersBackend",
+        "PreTrainedTokenizerFast",
+        "PreTrainedTokenizer",
+        "PreTrainedTokenizerBase",
+        "PythonBackend",
+    }
+)
+
+
+def _read_declared_tokenizer_class(tokenizer_name, revision=None):
+    """Return tokenizer_class from tokenizer_config.json, or None if unavailable."""
+    try:
+        config_file = _resolve_local_or_cached_file(
+            tokenizer_name, "tokenizer_config.json", revision
+        )
+        with open(config_file) as f:
+            tok_config = json.load(f)
+        return tok_config.get("tokenizer_class")
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as e:
+        logger.debug(
+            "Failed to read tokenizer_config.json for %s: %s", tokenizer_name, e
+        )
+        return None
+
 
 def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
     """Load tokenizer by the class declared in tokenizer_config.json.
@@ -60,8 +91,8 @@ def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
     """
     import transformers
 
+    revision = kwargs.get("revision") or kwargs.get("tokenizer_revision")
     try:
-        revision = kwargs.get("revision") or kwargs.get("tokenizer_revision")
         config_file = _resolve_local_or_cached_file(
             tokenizer_name, "tokenizer_config.json", revision
         )
@@ -79,8 +110,8 @@ def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
     if not tok_class_name:
         return None
 
-    # Skip base classes that don't implement required methods (e.g. get_vocab)
-    if tok_class_name in ("PreTrainedTokenizer", "PreTrainedTokenizerBase"):
+    # Skip generic bases/aliases (no model-specific class to recover).
+    if tok_class_name in _GENERIC_TOKENIZER_CLASS_NAMES:
         return None
 
     tok_cls = getattr(transformers, tok_class_name, None)
@@ -232,7 +263,19 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
         )
 
     if type(tokenizer).__name__ == _TOKENIZERS_BACKEND:
-        if common_kwargs.get("trust_remote_code"):
+        declared = _read_declared_tokenizer_class(
+            tokenizer_name,
+            revision=common_kwargs.get("revision")
+            or common_kwargs.get("tokenizer_revision"),
+        )
+        if declared is None or declared in _GENERIC_TOKENIZER_CLASS_NAMES:
+            logger.debug(
+                "Tokenizer for %s is TokenizersBackend (declared class %s); "
+                "generic backend is expected.",
+                tokenizer_name,
+                declared,
+            )
+        elif common_kwargs.get("trust_remote_code"):
             logger.warning(
                 "Tokenizer for %s is still TokenizersBackend after retries "
                 "with --trust-remote-code. Model-specific tokenizer attributes "
