@@ -4,7 +4,7 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.models.utils import fused_qk_gemma_rmsnorm_with_gate
+from sglang.srt.models.utils import fused_qk_gemma_rmsnorm, fused_qk_gemma_rmsnorm_with_gate
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
@@ -145,6 +145,42 @@ def test_contiguous_k_also_works(seq_len: int):
     torch.testing.assert_close(q_out, q_ref, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(k_out, k_ref, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(gate_out, gate_ref, atol=0, rtol=0)
+
+
+def test_empty_batch_with_gate_no_launch():
+    """seq_len=0 must return empty outs without launching grid (0,)."""
+    num_heads, num_kv_heads, head_dim = 16, 4, 128
+    eps = 1e-6
+    q_size = num_heads * head_dim
+    kv_size = num_kv_heads * head_dim
+    q_gate = torch.empty(0, q_size * 2, device=DEVICE, dtype=DTYPE)
+    k = torch.empty(0, kv_size, device=DEVICE, dtype=DTYPE)
+    q_weight = torch.randn(head_dim, device=DEVICE, dtype=DTYPE)
+    k_weight = torch.randn(head_dim, device=DEVICE, dtype=DTYPE)
+
+    q_out, k_out, gate_out = fused_qk_gemma_rmsnorm_with_gate(
+        q_gate, k, q_weight, k_weight, eps, head_dim, num_heads
+    )
+    assert q_out.shape == (0, head_dim), f"q_out.shape {q_out.shape} != (0, {head_dim})"
+    assert k_out.shape == (0, head_dim), f"k_out.shape {k_out.shape} != (0, {head_dim})"
+    assert gate_out.shape == (0, head_dim), f"gate_out.shape {gate_out.shape} != (0, {head_dim})"
+    assert q_out.dtype == DTYPE and q_out.device.type == DEVICE
+    assert k_out.dtype == DTYPE and gate_out.dtype == DTYPE
+
+
+def test_empty_batch_no_gate_no_launch():
+    """seq_len=0 for non-gate variant must return empty outs without launching grid (0,)."""
+    num_heads, num_kv_heads, head_dim = 16, 4, 128
+    eps = 1e-6
+    q = torch.empty(0, num_heads * head_dim, device=DEVICE, dtype=DTYPE)
+    k = torch.empty(0, num_kv_heads * head_dim, device=DEVICE, dtype=DTYPE)
+    q_weight = torch.randn(head_dim, device=DEVICE, dtype=DTYPE)
+    k_weight = torch.randn(head_dim, device=DEVICE, dtype=DTYPE)
+
+    q_out, k_out = fused_qk_gemma_rmsnorm(q, k, q_weight, k_weight, eps, head_dim)
+    assert q_out.shape == (0, head_dim), f"q_out.shape {q_out.shape} != (0, {head_dim})"
+    assert k_out.shape == (0, head_dim), f"k_out.shape {k_out.shape} != (0, {head_dim})"
+    assert q_out.dtype == DTYPE and k_out.dtype == DTYPE
 
 
 if __name__ == "__main__":
