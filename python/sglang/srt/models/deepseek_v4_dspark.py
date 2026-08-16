@@ -18,6 +18,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
@@ -741,8 +742,13 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if input_embeds is None:
             input_embeds = self.forward_embed(input_ids)
         x = input_embeds
-        for stage in self.stages:
-            x = stage(positions, x, forward_batch)
+        # Draft stages are indexed from 0 and own no rows in the expert
+        # distribution recorder's counters, which are sized by the target's
+        # num_hidden_layers. Recording here would both index with a layer that
+        # was never set and fold draft routing into target statistics.
+        with get_global_expert_distribution_recorder().disable_this_region():
+            for stage in self.stages:
+                x = stage(positions, x, forward_batch)
 
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
