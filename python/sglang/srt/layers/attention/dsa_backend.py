@@ -86,6 +86,18 @@ from sglang.srt.utils import (
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
 
+DSA_TRTLLM_MAX_PSEUDO_BATCH = 65535
+
+
+def _pseudo_batch_slices(
+    num_rows: int, max_rows: int = DSA_TRTLLM_MAX_PSEUDO_BATCH
+) -> list[slice]:
+    return [
+        slice(i, min(i + max_rows, num_rows))
+        for i in range(0, num_rows, max_rows)
+    ]
+
+
 if is_cuda():
     import deep_gemm
 
@@ -3232,12 +3244,13 @@ class DeepseekSparseAttnBackend(
         batch_size = page_table_1.shape[0]
         _, num_heads, head_dim = q_all.shape
 
+        chunk_max = min(batch_size, DSA_TRTLLM_MAX_PSEUDO_BATCH)
         self._multi_ctas_kv_counter_buffer = (
             grow_multi_ctas_kv_counter_buffer_if_needed(
                 self._multi_ctas_kv_counter_buffer,
                 torch.device(self.device),
                 self.num_q_heads,
-                batch_size,
+                chunk_max,
             )
         )
 
@@ -3255,22 +3268,47 @@ class DeepseekSparseAttnBackend(
             seq_chunks = list(torch.split(seq_lens, cp_meta.split_list, dim=0))
             seq_lens = torch.cat([seq_chunks[i] for i in cp_meta.zigzag_index], dim=0)
 
-        out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
-            query=q,
-            kv_cache=kv,
-            workspace_buffer=self.workspace_buffer,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            max_seq_len=metadata.max_seq_len_k,
-            sparse_mla_top_k=self.dsa_index_topk,
-            bmm1_scale=bmm1_scale,
-            backend="trtllm-gen",
-            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-            multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+        if batch_size <= DSA_TRTLLM_MAX_PSEUDO_BATCH:
+            return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                query=q,
+                kv_cache=kv,
+                workspace_buffer=self.workspace_buffer,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                max_seq_len=metadata.max_seq_len_k,
+                sparse_mla_top_k=self.dsa_index_topk,
+                bmm1_scale=bmm1_scale,
+                backend="trtllm-gen",
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+            )
+
+        out = torch.empty(
+            (batch_size, 1, num_heads, self.kv_lora_rank),
+            dtype=torch.bfloat16,
+            device=q.device,
         )
+        for s in _pseudo_batch_slices(batch_size):
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                query=q[s],
+                kv_cache=kv,
+                workspace_buffer=self.workspace_buffer,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                block_tables=block_tables[s],
+                seq_lens=seq_lens[s] if seq_lens is not None else None,
+                max_seq_len=metadata.max_seq_len_k,
+                sparse_mla_top_k=self.dsa_index_topk,
+                out=out[s],
+                bmm1_scale=bmm1_scale,
+                backend="trtllm-gen",
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+            )
 
         return out
 
